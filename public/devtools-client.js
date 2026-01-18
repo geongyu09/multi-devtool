@@ -219,6 +219,24 @@
           response.result = {};
           break;
 
+        case "Network.getResponseBody":
+          console.log("[RemoteDevTools] Network.getResponseBody:", msg.params.requestId);
+          const responseData = responseBodyMap.get(msg.params.requestId);
+          if (responseData) {
+            response.result = {
+              body: responseData.body,
+              base64Encoded: responseData.base64Encoded
+            };
+            console.log("[RemoteDevTools] 응답 본문 반환:", msg.params.requestId);
+          } else {
+            response.error = {
+              code: -32000,
+              message: `No resource with given identifier found`
+            };
+            console.warn("[RemoteDevTools] 응답 본문 없음:", msg.params.requestId);
+          }
+          break;
+
         case "Console.enable":
         case "Log.enable":
         case "Log.startViolationsReport":
@@ -426,6 +444,23 @@
 
   // 네트워크 모니터링
   let networkMonitoringEnabled = false;
+  const responseBodyMap = new Map(); // requestId -> response body 저장
+  const MAX_RESPONSES = 100; // 최대 저장 개수
+  const MAX_BODY_SIZE = 10 * 1024 * 1024; // 최대 응답 크기: 10MB
+
+  // 오래된 응답 정리
+  function cleanupOldResponses() {
+    if (responseBodyMap.size > MAX_RESPONSES) {
+      const entriesToDelete = responseBodyMap.size - MAX_RESPONSES;
+      const iterator = responseBodyMap.keys();
+      for (let i = 0; i < entriesToDelete; i++) {
+        const key = iterator.next().value;
+        responseBodyMap.delete(key);
+      }
+      originalConsole.log(`[RemoteDevTools] 오래된 응답 ${entriesToDelete}개 정리됨`);
+    }
+  }
+
   function setupNetworkMonitoring() {
     if (networkMonitoringEnabled) {
       originalConsole.log("[RemoteDevTools] 네트워크 모니터링 이미 활성화됨");
@@ -473,10 +508,67 @@
         },
       });
 
-      return originalFetch.apply(this, args).then((response) => {
+      return originalFetch.apply(this, args).then(async (response) => {
         const responseTimestamp = performance.now() / 1000;
 
         originalConsole.log("[RemoteDevTools] 네트워크 응답 수신:", response.status, url);
+
+        // 응답 본문 저장 (response는 스트림이므로 clone 필요)
+        const clonedResponse = response.clone();
+        try {
+          const contentType = response.headers.get('content-type') || '';
+          const contentLength = parseInt(response.headers.get('content-length') || '0');
+
+          // 크기가 너무 크면 저장하지 않음
+          if (contentLength > MAX_BODY_SIZE) {
+            originalConsole.warn(`[RemoteDevTools] 응답이 너무 큼 (${contentLength} bytes), 저장 생략`);
+            responseBodyMap.set(requestId, {
+              body: `[응답이 너무 큽니다: ${(contentLength / 1024 / 1024).toFixed(2)} MB]`,
+              base64Encoded: false
+            });
+          } else {
+            let body;
+
+            if (contentType.includes('application/json')) {
+              body = await clonedResponse.text();
+            } else if (contentType.includes('text/')) {
+              body = await clonedResponse.text();
+            } else {
+              // 바이너리 데이터는 base64로 인코딩
+              const blob = await clonedResponse.blob();
+
+              // 실제 크기 확인
+              if (blob.size > MAX_BODY_SIZE) {
+                originalConsole.warn(`[RemoteDevTools] Blob이 너무 큼 (${blob.size} bytes), 저장 생략`);
+                body = `[응답이 너무 큽니다: ${(blob.size / 1024 / 1024).toFixed(2)} MB]`;
+              } else {
+                const reader = new FileReader();
+                body = await new Promise((resolve) => {
+                  reader.onloadend = () => resolve(reader.result);
+                  reader.readAsDataURL(blob);
+                });
+              }
+            }
+
+            // 텍스트 응답의 경우 실제 크기 확인
+            if (typeof body === 'string' && body.length > MAX_BODY_SIZE) {
+              originalConsole.warn(`[RemoteDevTools] 텍스트 응답이 너무 큼 (${body.length} bytes), 잘라냄`);
+              body = body.substring(0, MAX_BODY_SIZE) + '\n\n[...응답이 잘렸습니다...]';
+            }
+
+            responseBodyMap.set(requestId, {
+              body: body,
+              base64Encoded: !contentType.includes('text/') && !contentType.includes('application/json')
+            });
+
+            originalConsole.log("[RemoteDevTools] 응답 본문 저장됨:", requestId, `(${body?.length || 0} bytes)`);
+          }
+
+          // 오래된 응답 정리
+          cleanupOldResponses();
+        } catch (error) {
+          originalConsole.error("[RemoteDevTools] 응답 본문 저장 실패:", error);
+        }
 
         // 응답 헤더 추출
         const responseHeaders = {};
@@ -558,7 +650,265 @@
       });
     };
 
-    originalConsole.log("[RemoteDevTools] 네트워크 모니터링 설정 완료!");
+    // XMLHttpRequest 모니터링 (axios 등)
+    const originalXHR = window.XMLHttpRequest;
+    window.XMLHttpRequest = function() {
+      const xhr = new originalXHR();
+      const requestId = 'xhr-' + Math.random().toString(36).substring(2, 11);
+      let requestUrl = '';
+      let requestMethod = 'GET';
+      let requestHeaders = {};
+      let requestStartTime = 0;
+      let requestStartTimestamp = 0;
+
+      // open 메서드 오버라이드
+      const originalOpen = xhr.open;
+      xhr.open = function(method, url) {
+        requestMethod = method;
+        requestUrl = url;
+        requestStartTime = Date.now() / 1000;
+        requestStartTimestamp = performance.now() / 1000;
+
+        originalConsole.log("[RemoteDevTools] XHR 요청 감지:", method, url);
+
+        return originalOpen.apply(this, arguments);
+      };
+
+      // setRequestHeader 오버라이드
+      const originalSetRequestHeader = xhr.setRequestHeader;
+      xhr.setRequestHeader = function(header, value) {
+        requestHeaders[header] = value;
+        return originalSetRequestHeader.apply(this, arguments);
+      };
+
+      // send 메서드 오버라이드
+      const originalSend = xhr.send;
+      xhr.send = function(data) {
+        // Network.requestWillBeSent 이벤트
+        sendMessage({
+          method: "Network.requestWillBeSent",
+          params: {
+            requestId: requestId,
+            loaderId: "loader-1",
+            documentURL: window.location.href,
+            request: {
+              url: requestUrl,
+              method: requestMethod,
+              headers: requestHeaders,
+              initialPriority: "High",
+              referrerPolicy: "strict-origin-when-cross-origin",
+              postData: data,
+            },
+            timestamp: requestStartTimestamp,
+            wallTime: requestStartTime,
+            initiator: {
+              type: "script",
+              stack: {
+                callFrames: []
+              }
+            },
+            type: "XHR",
+          },
+        });
+
+        // readystatechange 리스너 추가
+        xhr.addEventListener('readystatechange', function() {
+          if (xhr.readyState === 4) {
+            const responseTimestamp = performance.now() / 1000;
+
+            // 응답 본문 저장
+            try {
+              let body = xhr.responseText || '';
+              let base64Encoded = false;
+
+              // 크기 확인
+              const bodySize = body.length;
+              if (bodySize > MAX_BODY_SIZE) {
+                originalConsole.warn(`[RemoteDevTools] XHR 응답이 너무 큼 (${bodySize} bytes), 잘라냄`);
+                body = body.substring(0, MAX_BODY_SIZE) + '\n\n[...응답이 잘렸습니다...]';
+              }
+
+              // 바이너리 응답인 경우
+              if (xhr.responseType === 'blob' || xhr.responseType === 'arraybuffer') {
+                base64Encoded = true;
+                body = '[바이너리 데이터]';
+              }
+
+              responseBodyMap.set(requestId, {
+                body: body,
+                base64Encoded: base64Encoded
+              });
+
+              originalConsole.log("[RemoteDevTools] XHR 응답 본문 저장됨:", requestId, `(${bodySize} bytes)`);
+
+              // 오래된 응답 정리
+              cleanupOldResponses();
+            } catch (error) {
+              originalConsole.error("[RemoteDevTools] XHR 응답 본문 저장 실패:", error);
+            }
+
+            // 응답 헤더 파싱
+            const responseHeaders = {};
+            const headersString = xhr.getAllResponseHeaders();
+            if (headersString) {
+              headersString.trim().split('\r\n').forEach(line => {
+                const parts = line.split(': ');
+                if (parts.length === 2) {
+                  responseHeaders[parts[0]] = parts[1];
+                }
+              });
+            }
+
+            if (xhr.status >= 200 && xhr.status < 400) {
+              originalConsole.log("[RemoteDevTools] XHR 응답 수신:", xhr.status, requestUrl);
+
+              // Network.responseReceived 이벤트
+              sendMessage({
+                method: "Network.responseReceived",
+                params: {
+                  requestId: requestId,
+                  loaderId: "loader-1",
+                  timestamp: responseTimestamp,
+                  type: "XHR",
+                  response: {
+                    url: requestUrl,
+                    status: xhr.status,
+                    statusText: xhr.statusText,
+                    headers: responseHeaders,
+                    mimeType: xhr.getResponseHeader('content-type') || 'application/json',
+                    connectionReused: false,
+                    connectionId: 0,
+                    encodedDataLength: 0,
+                    fromDiskCache: false,
+                    fromServiceWorker: false,
+                    protocol: 'http/1.1',
+                    timing: {
+                      requestTime: requestStartTimestamp,
+                      proxyStart: -1,
+                      proxyEnd: -1,
+                      dnsStart: -1,
+                      dnsEnd: -1,
+                      connectStart: -1,
+                      connectEnd: -1,
+                      sslStart: -1,
+                      sslEnd: -1,
+                      workerStart: -1,
+                      workerReady: -1,
+                      sendStart: 0,
+                      sendEnd: 0,
+                      receiveHeadersEnd: (responseTimestamp - requestStartTimestamp) * 1000,
+                    }
+                  },
+                },
+              });
+
+              // Network.loadingFinished 이벤트
+              sendMessage({
+                method: "Network.loadingFinished",
+                params: {
+                  requestId: requestId,
+                  timestamp: responseTimestamp,
+                  encodedDataLength: xhr.responseText ? xhr.responseText.length : 0,
+                },
+              });
+            } else {
+              // 에러 응답
+              originalConsole.error("[RemoteDevTools] XHR 오류:", xhr.status, requestUrl);
+
+              // Network.responseReceived 이벤트 (에러도 응답은 받음)
+              sendMessage({
+                method: "Network.responseReceived",
+                params: {
+                  requestId: requestId,
+                  loaderId: "loader-1",
+                  timestamp: responseTimestamp,
+                  type: "XHR",
+                  response: {
+                    url: requestUrl,
+                    status: xhr.status,
+                    statusText: xhr.statusText,
+                    headers: responseHeaders,
+                    mimeType: xhr.getResponseHeader('content-type') || 'text/plain',
+                    connectionReused: false,
+                    connectionId: 0,
+                    encodedDataLength: 0,
+                    fromDiskCache: false,
+                    fromServiceWorker: false,
+                    protocol: 'http/1.1',
+                    timing: {
+                      requestTime: requestStartTimestamp,
+                      proxyStart: -1,
+                      proxyEnd: -1,
+                      dnsStart: -1,
+                      dnsEnd: -1,
+                      connectStart: -1,
+                      connectEnd: -1,
+                      sslStart: -1,
+                      sslEnd: -1,
+                      workerStart: -1,
+                      workerReady: -1,
+                      sendStart: 0,
+                      sendEnd: 0,
+                      receiveHeadersEnd: (responseTimestamp - requestStartTimestamp) * 1000,
+                    }
+                  },
+                },
+              });
+
+              // Network.loadingFinished 이벤트
+              sendMessage({
+                method: "Network.loadingFinished",
+                params: {
+                  requestId: requestId,
+                  timestamp: responseTimestamp,
+                  encodedDataLength: xhr.responseText ? xhr.responseText.length : 0,
+                },
+              });
+            }
+          }
+        });
+
+        // 에러 이벤트 리스너
+        xhr.addEventListener('error', function() {
+          const errorTimestamp = performance.now() / 1000;
+          originalConsole.error("[RemoteDevTools] XHR 네트워크 오류:", requestUrl);
+
+          sendMessage({
+            method: "Network.loadingFailed",
+            params: {
+              requestId: requestId,
+              timestamp: errorTimestamp,
+              type: "XHR",
+              errorText: "Network error",
+              canceled: false,
+            },
+          });
+        });
+
+        // abort 이벤트 리스너
+        xhr.addEventListener('abort', function() {
+          const abortTimestamp = performance.now() / 1000;
+          originalConsole.log("[RemoteDevTools] XHR 요청 취소:", requestUrl);
+
+          sendMessage({
+            method: "Network.loadingFailed",
+            params: {
+              requestId: requestId,
+              timestamp: abortTimestamp,
+              type: "XHR",
+              errorText: "Request aborted",
+              canceled: true,
+            },
+          });
+        });
+
+        return originalSend.apply(this, arguments);
+      };
+
+      return xhr;
+    };
+
+    originalConsole.log("[RemoteDevTools] 네트워크 모니터링 설정 완료 (Fetch + XHR)!");
   }
 
   // 콘솔 캡처
