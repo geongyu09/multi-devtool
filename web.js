@@ -127,8 +127,7 @@ app.get("/", async (_req, res) => {
                   등록 시간: ${new Date(page.registeredAt).toLocaleString()}
                 </div>
                 <a href="/inspector.html?ws=localhost:3002/devtools/page/${page.id}"
-                   class="inspect-btn"
-                   target="_blank">
+                   class="inspect-btn">
                   🔍 Inspect
                 </a>
               </li>
